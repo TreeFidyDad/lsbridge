@@ -1,8 +1,8 @@
 addon.name    = 'lsbridge'
 addon.author  = 'TreeFidyDad'
-addon.version = '1.0'
-addon.desc    = 'Linkshell <-> Discord bridge via file IPC with Jarvis bot.'
-addon.link    = 'https://github.com/TreeFidyDad/huntpartner'
+addon.version = '1.1'
+addon.desc    = 'Two linkshell <-> Discord bridge via file IPC with Jarvis bot.'
+addon.link    = 'https://github.com/TreeFidyDad/lsbridge'
 
 require('common')
 
@@ -14,11 +14,21 @@ local FFXI_TO_DISCORD = DATA_DIR .. '\\ffxi_to_discord.txt'
 local DISCORD_TO_FFXI = DATA_DIR .. '\\discord_to_ffxi.txt'
 local DEBUG_LOG = DATA_DIR .. '\\modes_debug.txt'
 
--- Which linkshell modes to bridge. Your own LS messages and other players'
--- incoming LS messages can arrive on different mode numbers, so we capture a set.
--- LS1 on HorizonXI: 6 = self, 14 = others (confirmed via mode logging).
-local LS_MODES = { [6] = true, [14] = true }   -- LS1 (self + others)
-local LS_MODES_2 = { [27] = true, [15] = true }  -- LS2 (assumed: self 27, others 15)
+-- Map each text_in chat mode to which linkshell it belongs to.
+-- Your own messages and other players' messages use different mode numbers.
+--   LS1 on HorizonXI: 6 = self, 14 = others (confirmed via mode logging).
+--   LS2 on HorizonXI: 27 = self, 15 = others (BEST GUESS - verify with /lsbridge logmode).
+local MODE_TO_LS = {
+    [6]  = 'LS1',
+    [14] = 'LS1',
+    [27] = 'LS2',
+    [15] = 'LS2',
+}
+-- The slash command used to broadcast back into each linkshell.
+local LS_SEND_CMD = {
+    LS1 = '/l',
+    LS2 = '/l2',
+}
 local POLL_INTERVAL = 1.0  -- seconds between file checks
 
 ------------------------------------------------------------
@@ -26,21 +36,25 @@ local POLL_INTERVAL = 1.0  -- seconds between file checks
 ------------------------------------------------------------
 local lastPoll = 0
 local enabled = true
+-- Per-linkshell enable toggle (both on by default).
+local enabledLS = { LS1 = true, LS2 = true }
 local lastFileSize = 0
 
 ------------------------------------------------------------
--- Write FFXI linkshell message to file for Discord bot
+-- Write FFXI linkshell message to file for Discord bot.
+-- Line format is "LS1|sender|message" so the bot can route per linkshell.
 ------------------------------------------------------------
-local function sendToDiscord(sender, message)
+local function sendToDiscord(ls, sender, message)
     local f = io.open(FFXI_TO_DISCORD, 'a')
     if f then
-        f:write(sender .. ': ' .. message .. '\n')
+        f:write(ls .. '|' .. sender .. '|' .. message .. '\n')
         f:close()
     end
 end
 
 ------------------------------------------------------------
--- Read Discord messages from file and display in FFXI
+-- Read Discord messages from file and broadcast into the right linkshell.
+-- Line format from the bot is "LS1|username|message".
 ------------------------------------------------------------
 local function pollDiscordMessages()
     local f = io.open(DISCORD_TO_FFXI, 'r')
@@ -65,9 +79,15 @@ local function pollDiscordMessages()
     
     for _, line in ipairs(lines) do
         if #line > 0 then
-            -- Send as actual linkshell message so everyone in LS sees it
-            local cmd = string.format('/l [Discord] %s', line)
-            AshitaCore:GetChatManager():QueueCommand(-1, cmd)
+            -- Parse routing tag: "LSx|user|message"
+            local ls, rest = line:match('^(LS%d)|(.+)$')
+            if not ls then
+                ls = 'LS1'      -- backward compatible: untagged -> LS1
+                rest = line
+            end
+            local cmd = LS_SEND_CMD[ls] or '/l'
+            -- Send as actual linkshell message so everyone in that LS sees it
+            AshitaCore:GetChatManager():QueueCommand(-1, string.format('%s [Discord] %s', cmd, rest))
         end
     end
 end
@@ -118,8 +138,10 @@ ashita.events.register('text_in', 'lsbridge_text_cb', function(e)
     
     if not enabled then return end
     
-    -- Check if this is a linkshell message (self or others)
-    if not LS_MODES[e.mode] then return end
+    -- Which linkshell did this message come from? (nil = not a bridged LS)
+    local ls = MODE_TO_LS[e.mode]
+    if not ls then return end
+    if not enabledLS[ls] then return end
     
     -- Don't relay messages containing [Discord] (prevents loop)
     if clean:match('%[Discord%]') then return end
@@ -135,11 +157,11 @@ ashita.events.register('text_in', 'lsbridge_text_cb', function(e)
     end
     if not sender or not text then
         -- Last resort: send the whole line
-        sendToDiscord('LS', clean)
+        sendToDiscord(ls, 'LS', clean)
         return
     end
     
-    sendToDiscord(sender, text)
+    sendToDiscord(ls, sender, text)
 end)
 
 ------------------------------------------------------------
@@ -167,9 +189,9 @@ ashita.events.register('command', 'lsbridge_cmd_cb', function(e)
     local sub = (args[2] or ''):lower()
     if sub == '' or sub == 'status' then
         local status = enabled and 'ENABLED' or 'DISABLED'
-        local modes = {}
-        for m in pairs(LS_MODES) do modes[#modes+1] = tostring(m) end
-        print(string.format('[LSBridge] Status: %s | LS Modes: %s | Poll: %.1fs', status, table.concat(modes, ','), POLL_INTERVAL))
+        print(string.format('[LSBridge] Status: %s | Poll: %.1fs', status, POLL_INTERVAL))
+        print(string.format('[LSBridge] LS1: %s (modes 6,14)  |  LS2: %s (modes 27,15)',
+            enabledLS.LS1 and 'on' or 'off', enabledLS.LS2 and 'on' or 'off'))
         print(string.format('[LSBridge] Files: %s', DATA_DIR))
     elseif sub == 'on' or sub == 'enable' then
         enabled = true
@@ -178,15 +200,16 @@ ashita.events.register('command', 'lsbridge_cmd_cb', function(e)
         enabled = false
         print('[LSBridge] Bridge disabled.')
     elseif sub == 'ls1' then
-        LS_MODES = { [6] = true, [14] = true }
-        print('[LSBridge] Now bridging LS1 (modes 6,14).')
+        enabledLS.LS1 = not enabledLS.LS1
+        print(string.format('[LSBridge] LS1 bridging: %s', enabledLS.LS1 and 'ON' or 'OFF'))
     elseif sub == 'ls2' then
-        LS_MODES = { [27] = true, [15] = true }
-        print('[LSBridge] Now bridging LS2 (modes 27,15).')
+        enabledLS.LS2 = not enabledLS.LS2
+        print(string.format('[LSBridge] LS2 bridging: %s', enabledLS.LS2 and 'ON' or 'OFF'))
     elseif sub == 'test' then
-        -- Send a test message to Discord
-        sendToDiscord('LSBridge', 'Test message from FFXI!')
-        print('[LSBridge] Test message sent to Discord file.')
+        -- Send a test message to Discord (LS1 by default, or LS2 via "/lsbridge test ls2")
+        local ls = ((args[3] or ''):lower() == 'ls2') and 'LS2' or 'LS1'
+        sendToDiscord(ls, 'LSBridge', 'Test message from FFXI!')
+        print(string.format('[LSBridge] Test message sent to Discord file (%s).', ls))
     elseif sub == 'clear' then
         -- Clear both files
         local f1 = io.open(FFXI_TO_DISCORD, 'w')
@@ -202,7 +225,7 @@ ashita.events.register('command', 'lsbridge_cmd_cb', function(e)
         logToFile = not logToFile
         print(string.format('[LSBridge] Mode logging to file: %s -> %s', logToFile and 'ON' or 'OFF', DEBUG_LOG))
     else
-        print('[LSBridge] Commands: /lsbridge [status|on|off|ls1|ls2|test|clear|debug|logmode]')
+        print('[LSBridge] Commands: /lsbridge [status|on|off|ls1|ls2|test [ls2]|clear|debug|logmode]')
     end
 end)
 
@@ -218,8 +241,8 @@ ashita.events.register('load', 'lsbridge_load_cb', function()
         f:close()
     end
     
-    print('[LSBridge] Loaded! Bridging LS1 <-> Discord (modes 6,14).')
-    print('[LSBridge] Commands: /lsbridge [status|on|off|ls1|ls2|test|clear|debug|logmode]')
+    print('[LSBridge] Loaded! Bridging LS1 (6,14) + LS2 (27,15) <-> Discord.')
+    print('[LSBridge] Commands: /lsbridge [status|on|off|ls1|ls2|test [ls2]|clear|debug|logmode]')
 end)
 
 ashita.events.register('unload', 'lsbridge_unload_cb', function()
