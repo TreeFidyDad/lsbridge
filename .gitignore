@@ -1,0 +1,6 @@
+# Local diagnostic output
+modes_debug.txt
+
+# OS junk
+.DS_Store
+Thumbs.db
