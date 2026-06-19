@@ -1,10 +1,11 @@
 addon.name    = 'lsbridge'
 addon.author  = 'TreeFidyDad'
-addon.version = '1.1'
+addon.version = '1.2'
 addon.desc    = 'Two linkshell <-> Discord bridge via file IPC with Jarvis bot.'
 addon.link    = 'https://github.com/TreeFidyDad/lsbridge'
 
 require('common')
+local imgui = require('imgui')
 
 ------------------------------------------------------------
 -- Config
@@ -18,12 +19,18 @@ local DEBUG_LOG = DATA_DIR .. '\\modes_debug.txt'
 -- Your own messages and other players' messages use different mode numbers.
 --   LS1 on HorizonXI: 6 = self, 14 = others (confirmed via mode logging).
 --   LS2 on HorizonXI: 27 = self, 15 = others (BEST GUESS - verify with /lsbridge logmode).
-local MODE_TO_LS = {
+-- NOTE: FFXI sometimes ORs high-order bitflags onto the base mode (e.g. 33554446 = 14 + flags).
+-- We mask to the lower 8 bits to extract the base chat type.
+local BASE_MODE_TO_LS = {
     [6]  = 'LS1',
     [14] = 'LS1',
     [27] = 'LS2',
     [15] = 'LS2',
 }
+local function modeToLS(mode)
+    local base = mode % 256  -- mask to lower 8 bits
+    return BASE_MODE_TO_LS[base]
+end
 -- The slash command used to broadcast back into each linkshell.
 local LS_SEND_CMD = {
     LS1 = '/l',
@@ -39,6 +46,12 @@ local enabled = true
 -- Per-linkshell enable toggle (both on by default).
 local enabledLS = { LS1 = true, LS2 = true }
 local lastFileSize = 0
+-- Discord chat window visibility
+local showDiscordWindow = { true }
+-- Discord message history (ring buffer, max 100 messages)
+local discordHistory = {}
+local MAX_HISTORY = 100
+local scrollToBottom = false
 
 ------------------------------------------------------------
 -- Write FFXI linkshell message to file for Discord bot.
@@ -53,7 +66,7 @@ local function sendToDiscord(ls, sender, message)
 end
 
 ------------------------------------------------------------
--- Read Discord messages from file and broadcast into the right linkshell.
+-- Read Discord messages from file and show in custom window.
 -- Line format from the bot is "LS1|username|message".
 ------------------------------------------------------------
 local function pollDiscordMessages()
@@ -64,6 +77,12 @@ local function pollDiscordMessages()
     f:close()
     
     if not content or #content == 0 then return end
+    -- File was truncated/cleared (it shrank since our last read) -- e.g. the
+    -- hourly clear or a bot restart. Reset the offset so we re-read from the
+    -- start instead of slicing past the end (which silently drops messages).
+    if #content < lastFileSize then
+        lastFileSize = 0
+    end
     if #content == lastFileSize then return end
     
     -- Only read new content
@@ -82,12 +101,19 @@ local function pollDiscordMessages()
             -- Parse routing tag: "LSx|user|message"
             local ls, rest = line:match('^(LS%d)|(.+)$')
             if not ls then
-                ls = 'LS1'      -- backward compatible: untagged -> LS1
+                ls = 'LS1'
                 rest = line
             end
-            local cmd = LS_SEND_CMD[ls] or '/l'
-            -- Send as actual linkshell message so everyone in that LS sees it
-            AshitaCore:GetChatManager():QueueCommand(-1, string.format('%s [Discord] %s', cmd, rest))
+            -- Add to history (ring buffer)
+            table.insert(discordHistory, {
+                time = os.date('%H:%M'),
+                ls = ls,
+                text = rest
+            })
+            if #discordHistory > MAX_HISTORY then
+                table.remove(discordHistory, 1)
+            end
+            scrollToBottom = true
         end
     end
 end
@@ -109,7 +135,7 @@ end
 -- Capture linkshell chat from text_in
 ------------------------------------------------------------
 local debugModes = false  -- set true to log all text_in modes to console
-local logToFile = false   -- set true (or /lsbridge logmode) to log all text_in modes to modes_debug.txt
+local logToFile = true    -- TEMP: capturing all modes to diagnose missing messages
 
 local function logMode(mode, text)
     local f = io.open(DEBUG_LOG, 'a')
@@ -123,10 +149,25 @@ ashita.events.register('text_in', 'lsbridge_text_cb', function(e)
     if e.injected then return end
     
     local msg = e.message or ''
-    -- Strip ALL FFXI color/control codes (more aggressive)
-    local clean = msg:gsub('\x1E.', ''):gsub('\x1F.', ''):gsub('\x7F.', ''):gsub('%z', '')
-    -- Also strip any remaining non-printable chars
+    -- Decode auto-translate tokens into readable text (e.g. "All right!") using
+    -- Ashita's chat manager, then strip color/translate control codes. This is
+    -- the same approach chatfeed uses. Without this, auto-translate phrases are
+    -- opaque tokens that the Discord bot would post as garbage ("??").
+    local clean = msg
+    local ok = pcall(function()
+        clean = AshitaCore:GetChatManager():ParseAutoTranslate(msg, true)
+        clean = clean:strip_colors()
+        clean = clean:strip_translate(true)
+    end)
+    if not ok then clean = msg end
+    -- Belt-and-suspenders: strip any leftover FFXI control codes / stray bytes.
+    clean = clean:gsub('\x1E.', ''):gsub('\x1F.', ''):gsub('\x7F.', ''):gsub('%z', '')
+    clean = clean:gsub(string.char(0x07), ' ')
     clean = clean:gsub('[%c]', '')
+    -- Drop any remaining non-ASCII bytes that can't survive the trip to Discord.
+    clean = clean:gsub('[\128-\255]', '')
+    -- Collapse the whitespace any stripped tokens left behind.
+    clean = clean:gsub('%s+', ' '):gsub('^%s+', ''):gsub('%s+$', '')
     if #clean < 2 then return end
     
     -- Diagnostic logging of every mode (helps identify LS modes)
@@ -139,7 +180,8 @@ ashita.events.register('text_in', 'lsbridge_text_cb', function(e)
     if not enabled then return end
     
     -- Which linkshell did this message come from? (nil = not a bridged LS)
-    local ls = MODE_TO_LS[e.mode]
+    -- Use modeToLS() which masks off high-order bitflags.
+    local ls = modeToLS(e.mode)
     if not ls then return end
     if not enabledLS[ls] then return end
     
@@ -160,7 +202,12 @@ ashita.events.register('text_in', 'lsbridge_text_cb', function(e)
         sendToDiscord(ls, 'LS', clean)
         return
     end
-    
+
+    -- Drop messages whose body was entirely auto-translate / non-ASCII and is
+    -- now empty after stripping, so we never post a blank/garbled line.
+    text = text:gsub('^%s+', ''):gsub('%s+$', '')
+    if #text == 0 then return end
+
     sendToDiscord(ls, sender, text)
 end)
 
@@ -176,6 +223,35 @@ ashita.events.register('d3d_present', 'lsbridge_poll_cb', function()
     
     pollDiscordMessages()
     maybeClearFile()
+end)
+
+------------------------------------------------------------
+-- ImGui Discord Chat Window
+------------------------------------------------------------
+ashita.events.register('d3d_present', 'lsbridge_ui_cb', function()
+    if not showDiscordWindow[1] then return end
+    
+    imgui.SetNextWindowSize({ 350, 200 }, ImGuiCond_FirstUseEver)
+    if imgui.Begin('Discord Chat', showDiscordWindow, ImGuiWindowFlags_None) then
+        -- Chat history area (scrollable)
+        local footerHeight = 0
+        imgui.BeginChild('ChatHistory', { 0, -footerHeight }, true, ImGuiWindowFlags_None)
+        
+        for _, msg in ipairs(discordHistory) do
+            -- Color by linkshell
+            local color = msg.ls == 'LS2' and { 0.6, 0.8, 1.0, 1.0 } or { 0.4, 1.0, 0.6, 1.0 }
+            imgui.TextColored(color, string.format('[%s] [%s] %s', msg.time, msg.ls, msg.text))
+        end
+        
+        -- Auto-scroll to bottom on new messages
+        if scrollToBottom then
+            imgui.SetScrollHereY(1.0)
+            scrollToBottom = false
+        end
+        
+        imgui.EndChild()
+    end
+    imgui.End()
 end)
 
 ------------------------------------------------------------
@@ -224,8 +300,14 @@ ashita.events.register('command', 'lsbridge_cmd_cb', function(e)
     elseif sub == 'logmode' then
         logToFile = not logToFile
         print(string.format('[LSBridge] Mode logging to file: %s -> %s', logToFile and 'ON' or 'OFF', DEBUG_LOG))
+    elseif sub == 'window' or sub == 'discord' then
+        showDiscordWindow[1] = not showDiscordWindow[1]
+        print(string.format('[LSBridge] Discord window: %s', showDiscordWindow[1] and 'SHOWN' or 'HIDDEN'))
+    elseif sub == 'clearchat' then
+        discordHistory = {}
+        print('[LSBridge] Discord chat history cleared.')
     else
-        print('[LSBridge] Commands: /lsbridge [status|on|off|ls1|ls2|test [ls2]|clear|debug|logmode]')
+        print('[LSBridge] Commands: /lsbridge [status|on|off|ls1|ls2|test [ls2]|clear|debug|logmode|window|clearchat]')
     end
 end)
 
@@ -242,7 +324,7 @@ ashita.events.register('load', 'lsbridge_load_cb', function()
     end
     
     print('[LSBridge] Loaded! Bridging LS1 (6,14) + LS2 (27,15) <-> Discord.')
-    print('[LSBridge] Commands: /lsbridge [status|on|off|ls1|ls2|test [ls2]|clear|debug|logmode]')
+    print('[LSBridge] Commands: /lsbridge [status|on|off|ls1|ls2|window|clearchat|test|clear|debug|logmode]')
 end)
 
 ashita.events.register('unload', 'lsbridge_unload_cb', function()
