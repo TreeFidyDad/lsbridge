@@ -1,6 +1,6 @@
 addon.name    = 'lsbridge'
 addon.author  = 'TreeFidyDad'
-addon.version = '1.2'
+addon.version = '1.3'
 addon.desc    = 'Two linkshell <-> Discord bridge via file IPC with Jarvis bot.'
 addon.link    = 'https://github.com/TreeFidyDad/lsbridge'
 
@@ -45,6 +45,10 @@ local lastPoll = 0
 local enabled = true
 -- Per-linkshell enable toggle (both on by default).
 local enabledLS = { LS1 = true, LS2 = true }
+-- When true, Discord messages are broadcast into the real in-game linkshell
+-- (via /l or /l2) so every LS member sees them -- this is the "2-way" relay.
+-- When false, they only appear in the floating Discord Chat window below.
+local relayToLS = true
 local lastFileSize = 0
 -- Discord chat window visibility
 local showDiscordWindow = { true }
@@ -104,16 +108,36 @@ local function pollDiscordMessages()
                 ls = 'LS1'
                 rest = line
             end
+            -- Split "user|message"; fall back to the whole thing as the body.
+            local user, body = rest:match('^([^|]*)|(.*)$')
+            if not user then
+                user = 'Discord'
+                body = rest
+            end
             -- Add to history (ring buffer)
             table.insert(discordHistory, {
                 time = os.date('%H:%M'),
                 ls = ls,
-                text = rest
+                text = string.format('%s: %s', user, body)
             })
             if #discordHistory > MAX_HISTORY then
                 table.remove(discordHistory, 1)
             end
             scrollToBottom = true
+
+            -- Broadcast into the real linkshell so everyone in-game sees it.
+            -- The "[Discord]" tag is what the text_in handler keys off to avoid
+            -- relaying our own broadcast back to Discord (loop prevention).
+            if relayToLS and enabledLS[ls] then
+                local cmd = LS_SEND_CMD[ls]
+                if cmd then
+                    -- FFXI truncates long LS lines; keep the whole thing under
+                    -- ~150 chars including the "[Discord] user: " prefix.
+                    local text = string.format('[Discord] %s: %s', user, body)
+                    if #text > 150 then text = text:sub(1, 150) end
+                    AshitaCore:GetChatManager():QueueCommand(1, cmd .. ' ' .. text)
+                end
+            end
         end
     end
 end
@@ -268,6 +292,7 @@ ashita.events.register('command', 'lsbridge_cmd_cb', function(e)
         print(string.format('[LSBridge] Status: %s | Poll: %.1fs', status, POLL_INTERVAL))
         print(string.format('[LSBridge] LS1: %s (modes 6,14)  |  LS2: %s (modes 27,15)',
             enabledLS.LS1 and 'on' or 'off', enabledLS.LS2 and 'on' or 'off'))
+        print(string.format('[LSBridge] Broadcast Discord -> LS chat: %s', relayToLS and 'ON' or 'OFF'))
         print(string.format('[LSBridge] Files: %s', DATA_DIR))
     elseif sub == 'on' or sub == 'enable' then
         enabled = true
@@ -281,6 +306,9 @@ ashita.events.register('command', 'lsbridge_cmd_cb', function(e)
     elseif sub == 'ls2' then
         enabledLS.LS2 = not enabledLS.LS2
         print(string.format('[LSBridge] LS2 bridging: %s', enabledLS.LS2 and 'ON' or 'OFF'))
+    elseif sub == 'say' or sub == 'broadcast' then
+        relayToLS = not relayToLS
+        print(string.format('[LSBridge] Broadcast Discord -> LS chat: %s', relayToLS and 'ON' or 'OFF'))
     elseif sub == 'test' then
         -- Send a test message to Discord (LS1 by default, or LS2 via "/lsbridge test ls2")
         local ls = ((args[3] or ''):lower() == 'ls2') and 'LS2' or 'LS1'
@@ -307,7 +335,7 @@ ashita.events.register('command', 'lsbridge_cmd_cb', function(e)
         discordHistory = {}
         print('[LSBridge] Discord chat history cleared.')
     else
-        print('[LSBridge] Commands: /lsbridge [status|on|off|ls1|ls2|test [ls2]|clear|debug|logmode|window|clearchat]')
+        print('[LSBridge] Commands: /lsbridge [status|on|off|ls1|ls2|say|test [ls2]|clear|debug|logmode|window|clearchat]')
     end
 end)
 
