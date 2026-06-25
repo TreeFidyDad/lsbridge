@@ -1,11 +1,12 @@
 addon.name    = 'lsbridge'
 addon.author  = 'TreeFidyDad'
-addon.version = '1.3'
+addon.version = '1.4'
 addon.desc    = 'Two linkshell <-> Discord bridge via file IPC with Jarvis bot.'
 addon.link    = 'https://github.com/TreeFidyDad/lsbridge'
 
 require('common')
 local imgui = require('imgui')
+local chat = require('chat')
 
 ------------------------------------------------------------
 -- Config
@@ -36,6 +37,12 @@ local LS_SEND_CMD = {
     LS1 = '/l',
     LS2 = '/l2',
 }
+-- Native-looking display per linkshell: the [n] prefix FFXI shows and the
+-- chat color code (LS1 green, LS2 cyan) so injected Discord lines blend in.
+local LS_DISPLAY = {
+    LS1 = { num = 1, color = 2 },  -- green
+    LS2 = { num = 2, color = 6 },  -- cyan
+}
 local POLL_INTERVAL = 1.0  -- seconds between file checks
 
 ------------------------------------------------------------
@@ -46,9 +53,12 @@ local enabled = true
 -- Per-linkshell enable toggle (both on by default).
 local enabledLS = { LS1 = true, LS2 = true }
 -- When true, Discord messages are broadcast into the real in-game linkshell
--- (via /l or /l2) so every LS member sees them -- this is the "2-way" relay.
--- When false, they only appear in the floating Discord Chat window below.
-local relayToLS = true
+-- (via /l or /l2) so every OTHER LS member sees them too. This is stamped with
+-- your own character name by FFXI (e.g. "[1]<You> [Discord] Valesti: ...") and
+-- can't show another player's name, so it's off by default. When false, Discord
+-- messages are instead printed into your local chat log formatted to look like a
+-- native LS line ("[1]<Valesti> ..."), visible only to you. Toggle: /lsbridge say
+local relayToLS = false
 local lastFileSize = 0
 -- Discord chat window visibility
 local showDiscordWindow = { true }
@@ -125,17 +135,26 @@ local function pollDiscordMessages()
             end
             scrollToBottom = true
 
-            -- Broadcast into the real linkshell so everyone in-game sees it.
-            -- The "[Discord]" tag is what the text_in handler keys off to avoid
-            -- relaying our own broadcast back to Discord (loop prevention).
-            if relayToLS and enabledLS[ls] then
-                local cmd = LS_SEND_CMD[ls]
-                if cmd then
-                    -- FFXI truncates long LS lines; keep the whole thing under
-                    -- ~150 chars including the "[Discord] user: " prefix.
-                    local text = string.format('[Discord] %s: %s', user, body)
-                    if #text > 150 then text = text:sub(1, 150) end
-                    AshitaCore:GetChatManager():QueueCommand(1, cmd .. ' ' .. text)
+            -- Show Discord messages in the game's chat log.
+            if enabledLS[ls] then
+                if relayToLS then
+                    -- Broadcast into the real linkshell so everyone in-game
+                    -- sees it. The "[Discord]" tag is what the text_in handler
+                    -- keys off to avoid relaying our own broadcast back (loop
+                    -- prevention). FFXI stamps this with OUR character name.
+                    local cmd = LS_SEND_CMD[ls]
+                    if cmd then
+                        local text = string.format('[Discord] %s: %s', user, body)
+                        if #text > 150 then text = text:sub(1, 150) end
+                        AshitaCore:GetChatManager():QueueCommand(1, cmd .. ' ' .. text)
+                    end
+                else
+                    -- Local-only: print a line that looks like a native LS
+                    -- message ("[1]<Valesti> ...") into our own chat log. Only
+                    -- we see it, but the Discord user appears as the sender.
+                    local disp = LS_DISPLAY[ls] or LS_DISPLAY.LS1
+                    local line = string.format('[%d]<%s> %s', disp.num, user, body)
+                    print(chat.color1(disp.color, line))
                 end
             end
         end
@@ -292,7 +311,7 @@ ashita.events.register('command', 'lsbridge_cmd_cb', function(e)
         print(string.format('[LSBridge] Status: %s | Poll: %.1fs', status, POLL_INTERVAL))
         print(string.format('[LSBridge] LS1: %s (modes 6,14)  |  LS2: %s (modes 27,15)',
             enabledLS.LS1 and 'on' or 'off', enabledLS.LS2 and 'on' or 'off'))
-        print(string.format('[LSBridge] Broadcast Discord -> LS chat: %s', relayToLS and 'ON' or 'OFF'))
+        print(string.format('[LSBridge] Discord display: %s', relayToLS and 'BROADCAST to whole LS (/l)' or 'LOCAL native lines (only you)'))
         print(string.format('[LSBridge] Files: %s', DATA_DIR))
     elseif sub == 'on' or sub == 'enable' then
         enabled = true
@@ -308,7 +327,7 @@ ashita.events.register('command', 'lsbridge_cmd_cb', function(e)
         print(string.format('[LSBridge] LS2 bridging: %s', enabledLS.LS2 and 'ON' or 'OFF'))
     elseif sub == 'say' or sub == 'broadcast' then
         relayToLS = not relayToLS
-        print(string.format('[LSBridge] Broadcast Discord -> LS chat: %s', relayToLS and 'ON' or 'OFF'))
+        print(string.format('[LSBridge] Discord display: %s', relayToLS and 'BROADCAST to whole LS (/l) -- shows your name' or 'LOCAL native lines (only you see them)'))
     elseif sub == 'test' then
         -- Send a test message to Discord (LS1 by default, or LS2 via "/lsbridge test ls2")
         local ls = ((args[3] or ''):lower() == 'ls2') and 'LS2' or 'LS1'
