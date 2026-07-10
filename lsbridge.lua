@@ -83,16 +83,29 @@ local scrollToBottom = false
 --                 burst at login/zone-in (never when you just open the window),
 --                 so enable this, then zone or relog, then grep the file for
 --                 member names to find the roster packet id + layout.
+--   pktDumpNames: dump ONLY packets that contain player-name-like text, skipping
+--                 the known party/position/chat noise. Best net for the roster:
+--                 turn it on, then open the Linkshell window / play a few minutes
+--                 and any unexpected name-bearing packet is flagged automatically.
 local pktScan = false
 local pktScanSeen = {}
 local pktDumpId = nil
 local pktDumpAll = false
+local pktDumpNames = false
 local pktDumpCount = 0
 local PKT_DUMP_MAX = 4000  -- auto-stop so a forgotten 'all' dump can't fill the disk
 -- Ultra-frequent packets that flood during zone-in and carry no roster data
 -- (position / entity spawn / char-status spam). Skipped in 'all' mode so the
 -- file stays small enough to catch and read the roster burst.
 local PKT_NOISE = { [0x00D] = true, [0x00E] = true, [0x037] = true }
+-- In 'names' mode also skip the packets we've already decoded as NOT the roster
+-- but which legitimately carry names: chat (0x017), self zone-in (0x00A), and the
+-- party/alliance family (0x0C8 list, 0x0DD member setup, 0x0DF member update).
+-- Whatever name-bearing packet remains is the linkshell roster candidate.
+local PKT_NAMES_SKIP = {
+    [0x00D] = true, [0x00E] = true, [0x037] = true, [0x017] = true,
+    [0x00A] = true, [0x0C8] = true, [0x0DD] = true, [0x0DF] = true,
+}
 
 ------------------------------------------------------------
 -- Write FFXI linkshell message to file for Discord bot.
@@ -292,6 +305,35 @@ end)
 --   4) /lsbridge pktdump 0xNNN      (dump the suspected id; names show in ASCII)
 -- Once the id/layout is known we can parse it into an on-screen list.
 ------------------------------------------------------------
+-- Heuristic: does this packet payload contain a FFXI-player-name-like token?
+-- Names are 1 uppercase letter followed by 2-14 lowercase letters (e.g.
+-- "Truedream", "Guivre"), terminated by a non-letter. Cheap scan, used by the
+-- 'names' dump mode so any unexpected name-bearing packet (the roster) is caught
+-- automatically whenever the server sends it.
+local function hasNameLike(data, size)
+    local n = math.min(size or 0, #data)
+    local i = 1
+    while i <= n do
+        local b = data:byte(i) or 0
+        if b >= 65 and b <= 90 then            -- uppercase A-Z starts a name
+            local len, j = 1, i + 1
+            while j <= n do
+                local c = data:byte(j) or 0
+                if c >= 97 and c <= 122 then    -- lowercase a-z continues it
+                    len = len + 1; j = j + 1
+                else
+                    break
+                end
+            end
+            if len >= 3 and len <= 15 then return true end
+            i = j
+        else
+            i = i + 1
+        end
+    end
+    return false
+end
+
 -- Append a classic hex + ASCII dump of one packet to PACKET_LOG. Capped so a
 -- large roster packet can't bloat the file. ASCII column makes player names,
 -- zone strings, etc. jump out visually.
@@ -333,7 +375,7 @@ end
 
 ashita.events.register('packet_in', 'lsbridge_packet_cb', function(e)
     -- Read-only: never blocks or modifies packets. Fast no-op when idle.
-    if not pktScan and not pktDumpId and not pktDumpAll then return end
+    if not pktScan and not pktDumpId and not pktDumpAll and not pktDumpNames then return end
     if pktScan then
         local rec = pktScanSeen[e.id]
         if rec then
@@ -350,6 +392,15 @@ ashita.events.register('packet_in', 'lsbridge_packet_cb', function(e)
             if pktDumpCount >= PKT_DUMP_MAX then
                 pktDumpAll = false
                 print(string.format('[LSBridge] pktdump all auto-stopped after %d packets.', PKT_DUMP_MAX))
+            end
+        end
+    elseif pktDumpNames then
+        if not PKT_NAMES_SKIP[e.id] and e.data and hasNameLike(e.data, e.size) then
+            dumpPacket(e.id, e.size, e.data)
+            pktDumpCount = pktDumpCount + 1
+            if pktDumpCount >= PKT_DUMP_MAX then
+                pktDumpNames = false
+                print(string.format('[LSBridge] pktdump names auto-stopped after %d packets.', PKT_DUMP_MAX))
             end
         end
     elseif pktDumpId and e.id == pktDumpId and e.data then
@@ -470,31 +521,43 @@ ashita.events.register('command', 'lsbridge_cmd_cb', function(e)
         end
     elseif sub == 'pktdump' then
         -- Hex+ASCII dump of incoming packets to packets_debug.txt so member
-        -- names/zones/jobs are visible. Either a single id (e.g. 0x0DD), or
-        -- "all" to dump everything except high-volume noise. Use "all" then
-        -- zone/relog to catch the linkshell roster (only sent at login/zone-in).
+        -- names/zones/jobs are visible. Modes:
+        --   0xNNN  a single packet id
+        --   all    everything except high-volume position/entity noise
+        --   names  only packets containing player-name-like text, skipping the
+        --          known party/position/chat noise -> best net for the roster
+        --   off    stop
         local a = (args[3] or ''):lower()
         if a == '' or a == 'off' then
             pktDumpId = nil
             pktDumpAll = false
+            pktDumpNames = false
             print('[LSBridge] Packet dump OFF.')
         elseif a == 'all' then
             pktDumpAll = true
             pktDumpId = nil
+            pktDumpNames = false
             pktDumpCount = 0
             print(string.format('[LSBridge] Packet dump ALL ON -> %s. Now ZONE or RELOG to capture the roster burst, then /lsbridge pktdump off.', PACKET_LOG))
+        elseif a == 'names' then
+            pktDumpNames = true
+            pktDumpAll = false
+            pktDumpId = nil
+            pktDumpCount = 0
+            print(string.format('[LSBridge] Packet dump NAMES ON -> %s. Open the Linkshell window / play a few minutes; any name-bearing packet is flagged. Then /lsbridge pktdump off.', PACKET_LOG))
         else
             local id = tonumber(a)  -- accepts 0x0DD (hex) or a decimal id
             if not id then
-                print('[LSBridge] Usage: /lsbridge pktdump 0x0DD | all | off')
+                print('[LSBridge] Usage: /lsbridge pktdump 0x0DD | all | names | off')
             else
                 pktDumpId = id
                 pktDumpAll = false
+                pktDumpNames = false
                 print(string.format('[LSBridge] Packet dump ON for 0x%03X -> %s. Open the Linkshell window to capture it.', id, PACKET_LOG))
             end
         end
     else
-        print('[LSBridge] Commands: /lsbridge [status|on|off|ls1|ls2|say|test [ls2]|clear|debug|logmode|window|clearchat|pktscan|pktdump <0xID|all|off>]')
+        print('[LSBridge] Commands: /lsbridge [status|on|off|ls1|ls2|say|test [ls2]|clear|debug|logmode|window|clearchat|pktscan|pktdump <0xID|all|names|off>]')
     end
 end)
 

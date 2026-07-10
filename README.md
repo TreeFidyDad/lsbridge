@@ -46,7 +46,7 @@ FFXI (Ashita)  --append-->  ffxi_to_discord.txt  --poll-->  Discord bot  -->  #l
 | `debug`    | Toggle printing every `text_in` mode to the console |
 | `logmode`  | Toggle logging every `text_in` mode to `modes_debug.txt` |
 | `pktscan`  | Toggle a summary scan of incoming packet ids (find the online-members packet — see below) |
-| `pktdump <0xID\|all\|off>` | Hex+ASCII dump packets to `packets_debug.txt`: a single id, `all` (everything except position/entity noise), or `off` |
+| `pktdump <0xID\|all\|names\|off>` | Hex+ASCII dump packets to `packets_debug.txt`: a single id, `all` (everything except position/entity noise), `names` (only name-bearing packets, skipping known noise — best for finding the roster), or `off` |
 
 ## Detecting online linkshell members
 
@@ -59,23 +59,30 @@ parsed.
 The addon ships read-only diagnostics to do that (they never block or modify
 packets, and are off by default).
 
-**Important:** opening the in-game Linkshell window sends **no packet** — the client
-already has the roster cached. The full roster is delivered in a **burst at login or
-when you zone**, so it has to be captured then, not by opening the window.
+**What we've ruled out so far:** opening the Linkshell window sends **no packet** (the
+client already has the roster cached), and neither **zoning** nor **logging in** delivers
+it — those only carry your **party/alliance** data (packets `0x0C8` list, `0x0DD` member
+setup, `0x0DF` member HP/MP/TP-and-job update). So the roster arrives by some other
+trigger (periodic refresh, or a member logging in/out or changing zone/job).
 
-Recommended workflow (catches the roster during a zone):
+**Recommended workflow — `names` mode (catches the roster whenever it arrives):**
 
-1. `/lsbridge pktdump all` — start dumping every incoming packet (except the
-   high-volume position/entity/status noise) to `packets_debug.txt`.
-2. **Zone** (walk across a zone line or use a Home Point / airship) or **relog** so the
-   server resends the roster.
+1. `/lsbridge pktdump names` — dumps **only** packets that contain player-name-like
+   text, automatically skipping the known noise (position/entity spam, chat, and the
+   party family above). It stays silent until an *unexpected* name-bearing packet shows
+   up — that packet is the roster candidate.
+2. Open the Linkshell window, then just **play for a few minutes** (zone around, let
+   members log in/out). No need to know the exact trigger.
 3. `/lsbridge pktdump off` — stop.
-4. Search `packets_debug.txt` for a known member name. The packet whose ASCII column
-   contains **names / zone strings** is the roster; its layout (name field, zone id,
-   job byte, etc.) is then read off the hex.
+4. Any packet written to `packets_debug.txt` is the roster candidate; its id + ASCII
+   column reveal the layout (name field, zone id, job byte, etc.).
 
-`/lsbridge pktscan` (start → do something → stop) is the lighter tool for just listing
-which ids appear, and `/lsbridge pktdump 0xNNN` dumps a single suspected id.
+Other tools:
+
+- `/lsbridge pktdump all` — dump every packet except high-volume noise (bigger/noisier;
+  use for a full login/zone burst capture).
+- `/lsbridge pktscan` (start → do something → stop) — just lists which packet ids appear.
+- `/lsbridge pktdump 0xNNN` — dump a single suspected id.
 
 Once the id and field offsets are known, that packet can be parsed into a table and
 shown in an on-screen list (and optionally pushed to Discord). Note HorizonXI's
