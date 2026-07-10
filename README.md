@@ -39,9 +39,40 @@ FFXI (Ashita)  --append-->  ffxi_to_discord.txt  --poll-->  Discord bot  -->  #l
 | `ls1`      | Toggle LS1 bridging on/off (chat modes 6 = self, 14 = others) |
 | `ls2`      | Toggle LS2 bridging on/off (chat modes 27 = self, 15 = others, assumed) |
 | `test [ls2]` | Write a test line to the Discord file (LS1, or LS2 if `ls2` given) |
+| `say`      | Toggle how Discord messages appear in game: local native-looking lines (only you) vs broadcast to the whole LS via `/l` |
+| `window`   | Toggle the ImGui Discord chat window |
 | `clear`    | Clear both IPC files |
+| `clearchat`| Clear the Discord chat window history |
 | `debug`    | Toggle printing every `text_in` mode to the console |
 | `logmode`  | Toggle logging every `text_in` mode to `modes_debug.txt` |
+| `pktscan`  | Toggle a summary scan of incoming packet ids (find the online-members packet — see below) |
+| `pktdump <0xID>` | Hex+ASCII dump a specific incoming packet id to `packets_debug.txt` (`off` to stop) |
+
+## Detecting online linkshell members
+
+The rich in-game **Linkshell** window (every online member with their main job and
+current zone) is a **HorizonXI custom feature** — retail FFXI has no packet that lists
+the whole online roster, and there's no published packet id for Horizon's version. So
+the addon can't read it out of the box; the packet has to be identified live, then
+parsed.
+
+The addon ships two read-only diagnostics to do that (they never block or modify
+packets, and are off by default):
+
+1. `/lsbridge pktscan` — start recording every incoming packet id (with a count and
+   last size).
+2. Open the in-game **Linkshell** window so the server sends the roster.
+3. `/lsbridge pktscan` — stop; it prints the ids seen (also written to
+   `packets_debug.txt`). The roster is usually an **infrequent id** that appears right
+   as the window opens.
+4. `/lsbridge pktdump 0xNNN` — dump that suspected id. The ASCII column makes member
+   **names / zone strings** obvious, which reveals the layout (name field, zone id,
+   job byte, etc.).
+
+Once the id and field offsets are known, that packet can be parsed into a table and
+shown in an on-screen list (and optionally pushed to Discord). Note HorizonXI's
+[addon policy](https://www.horizonxi.com/addons/) requires custom addons to be
+published/approved for general use.
 
 ## Chat modes (HorizonXI)
 

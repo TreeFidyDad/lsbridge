@@ -15,6 +15,10 @@ local DATA_DIR = 'C:\\Users\\Blake\\ffxi-jarvis\\data'
 local FFXI_TO_DISCORD = DATA_DIR .. '\\ffxi_to_discord.txt'
 local DISCORD_TO_FFXI = DATA_DIR .. '\\discord_to_ffxi.txt'
 local DEBUG_LOG = DATA_DIR .. '\\modes_debug.txt'
+-- Incoming-packet diagnostics (used to reverse-engineer the HorizonXI
+-- "Linkshell online members" packet so we can list who's online like the
+-- in-game Linkshell window). See /lsbridge pktscan and /lsbridge pktdump.
+local PACKET_LOG = DATA_DIR .. '\\packets_debug.txt'
 
 -- Map each text_in chat mode to which linkshell it belongs to.
 -- Your own messages and other players' messages use different mode numbers.
@@ -66,6 +70,17 @@ local showDiscordWindow = { true }
 local discordHistory = {}
 local MAX_HISTORY = 100
 local scrollToBottom = false
+
+-- Packet diagnostics state (both off by default; the packet_in handler is a
+-- no-op unless one of these is enabled).
+--   pktScan     : record a summary of every incoming packet id (count + last
+--                 size) so you can spot which new packet arrives when the
+--                 in-game Linkshell window opens/refreshes.
+--   pktDumpId   : when set to a packet id, write a hex+ASCII dump of just that
+--                 packet to PACKET_LOG so member names/zones/jobs are visible.
+local pktScan = false
+local pktScanSeen = {}
+local pktDumpId = nil
 
 ------------------------------------------------------------
 -- Write FFXI linkshell message to file for Discord bot.
@@ -255,6 +270,73 @@ ashita.events.register('text_in', 'lsbridge_text_cb', function(e)
 end)
 
 ------------------------------------------------------------
+-- Packet diagnostics: find & inspect the HorizonXI "Linkshell online members"
+-- packet. That rich roster (name + main job + zone) is a HorizonXI custom
+-- feature, not retail FFXI, so there's no documented packet id -- we have to
+-- capture it live. Workflow:
+--   1) /lsbridge pktscan            (start recording packet ids)
+--   2) open the in-game Linkshell window so the server sends the roster
+--   3) /lsbridge pktscan            (stop; prints a summary of ids seen)
+--   4) /lsbridge pktdump 0xNNN      (dump the suspected id; names show in ASCII)
+-- Once the id/layout is known we can parse it into an on-screen list.
+------------------------------------------------------------
+-- Append a classic hex + ASCII dump of one packet to PACKET_LOG. Capped so a
+-- large roster packet can't bloat the file. ASCII column makes player names,
+-- zone strings, etc. jump out visually.
+local function dumpPacket(id, size, data)
+    local f = io.open(PACKET_LOG, 'a')
+    if not f then return end
+    f:write(string.format('=== packet 0x%03X  size=%d  %s ===\n', id, size, os.date('%H:%M:%S')))
+    local n = math.min(size or 0, 512)
+    for off = 1, n, 16 do
+        local hex, ascii = '', ''
+        for i = off, math.min(off + 15, n) do
+            local b = data:byte(i) or 0
+            hex = hex .. string.format('%02X ', b)
+            ascii = ascii .. ((b >= 32 and b < 127) and string.char(b) or '.')
+        end
+        f:write(string.format('%04X  %-48s %s\n', off - 1, hex, ascii))
+    end
+    f:write('\n')
+    f:close()
+end
+
+-- Print (and log) the ids seen during a pktscan, sorted, so the roster packet
+-- is easy to pick out (usually an infrequent id that appears right as the
+-- Linkshell window opens).
+local function dumpScanSummary()
+    local ids = {}
+    for id in pairs(pktScanSeen) do ids[#ids + 1] = id end
+    table.sort(ids)
+    local f = io.open(PACKET_LOG, 'a')
+    if f then f:write(string.format('--- pktscan summary %s ---\n', os.date('%H:%M:%S'))) end
+    for _, id in ipairs(ids) do
+        local rec = pktScanSeen[id]
+        local line = string.format('0x%03X  count=%d  lastSize=%d', id, rec.count, rec.size)
+        print('[LSBridge] ' .. line)
+        if f then f:write(line .. '\n') end
+    end
+    if f then f:write('\n'); f:close() end
+end
+
+ashita.events.register('packet_in', 'lsbridge_packet_cb', function(e)
+    -- Read-only: never blocks or modifies packets. Fast no-op when idle.
+    if not pktScan and not pktDumpId then return end
+    if pktScan then
+        local rec = pktScanSeen[e.id]
+        if rec then
+            rec.count = rec.count + 1
+            rec.size = e.size
+        else
+            pktScanSeen[e.id] = { count = 1, size = e.size }
+        end
+    end
+    if pktDumpId and e.id == pktDumpId and e.data then
+        dumpPacket(e.id, e.size, e.data)
+    end
+end)
+
+------------------------------------------------------------
 -- Poll for Discord messages every frame (throttled)
 ------------------------------------------------------------
 ashita.events.register('d3d_present', 'lsbridge_poll_cb', function()
@@ -353,8 +435,36 @@ ashita.events.register('command', 'lsbridge_cmd_cb', function(e)
     elseif sub == 'clearchat' then
         discordHistory = {}
         print('[LSBridge] Discord chat history cleared.')
+    elseif sub == 'pktscan' then
+        -- Toggle a summary scan of incoming packet ids. Use it to find the
+        -- HorizonXI "Linkshell online members" packet: start scan, open the
+        -- in-game Linkshell window, stop scan, look for a new/infrequent id.
+        pktScan = not pktScan
+        if pktScan then
+            pktScanSeen = {}
+            print('[LSBridge] Packet scan STARTED. Now open the in-game Linkshell window, then run /lsbridge pktscan again to see the ids.')
+        else
+            print('[LSBridge] Packet scan STOPPED. Ids seen (also in packets_debug.txt):')
+            dumpScanSummary()
+        end
+    elseif sub == 'pktdump' then
+        -- Hex+ASCII dump a specific incoming packet id to packets_debug.txt so
+        -- member names/zones/jobs are visible. e.g. /lsbridge pktdump 0x0DD
+        local a = (args[3] or ''):lower()
+        if a == '' or a == 'off' then
+            pktDumpId = nil
+            print('[LSBridge] Packet dump OFF.')
+        else
+            local id = tonumber(a)  -- accepts 0x0DD (hex) or a decimal id
+            if not id then
+                print('[LSBridge] Usage: /lsbridge pktdump 0x0DD  (hex id with 0x prefix, a decimal id, or "off")')
+            else
+                pktDumpId = id
+                print(string.format('[LSBridge] Packet dump ON for 0x%03X -> %s. Open the Linkshell window to capture it.', id, PACKET_LOG))
+            end
+        end
     else
-        print('[LSBridge] Commands: /lsbridge [status|on|off|ls1|ls2|say|test [ls2]|clear|debug|logmode|window|clearchat]')
+        print('[LSBridge] Commands: /lsbridge [status|on|off|ls1|ls2|say|test [ls2]|clear|debug|logmode|window|clearchat|pktscan|pktdump <0xID>]')
     end
 end)
 
