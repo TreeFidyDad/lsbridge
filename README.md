@@ -46,7 +46,7 @@ FFXI (Ashita)  --append-->  ffxi_to_discord.txt  --poll-->  Discord bot  -->  #l
 | `debug`    | Toggle printing every `text_in` mode to the console |
 | `logmode`  | Toggle logging every `text_in` mode to `modes_debug.txt` |
 | `pktscan`  | Toggle a summary scan of incoming packet ids (find the online-members packet — see below) |
-| `pktdump <0xID\|all\|names\|off>` | Hex+ASCII dump packets to `packets_debug.txt`: a single id, `all` (everything except position/entity noise), `names` (only name-bearing packets, skipping known noise — best for finding the roster), or `off` |
+| `pktdump <0xID\|all\|names\|group\|off>` | Hex+ASCII dump packets to `packets_debug.txt`: a single id, `all` (everything except position/entity noise), `names` (only name-bearing packets, skipping known noise), `group` (only the party/group/linkshell-structure packets — best for finding the roster), or `off` |
 
 ## Detecting online linkshell members
 
@@ -59,29 +59,44 @@ parsed.
 The addon ships read-only diagnostics to do that (they never block or modify
 packets, and are off by default).
 
-**What we've ruled out so far:** opening the Linkshell window sends **no packet** (the
-client already has the roster cached), and neither **zoning** nor **logging in** delivers
-it — those only carry your **party/alliance** data (packets `0x0C8` list, `0x0DD` member
-setup, `0x0DF` member HP/MP/TP-and-job update). So the roster arrives by some other
-trigger (periodic refresh, or a member logging in/out or changing zone/job).
+**What we've ruled out so far:**
 
-**Recommended workflow — `names` mode (catches the roster whenever it arrives):**
+- Opening the Linkshell window sends **no packet** (the client already has the data cached).
+- **Zoning** doesn't deliver a roster.
+- The **Ashita v4 SDK exposes no linkshell roster in memory** — its memory manager only
+  offers party/alliance (up to 18 members), entities, player, target and inventory. (An
+  entity-table scan matching your own `LinkshellColor` can find LS members *in your current
+  zone*, but not those elsewhere.)
+- No installed HorizonXI addon (HXUI, xiui, etc.) implements the window — it's compiled into
+  the custom client, fed by a packet no addon handles.
+- Earlier "name" leads were red herrings: `0x070` is a **crafting result** (a nearby player's
+  synthesis), and `0x041` is the **blacklist** packet — neither is linkshell data.
 
-1. `/lsbridge pktdump names` — dumps **only** packets that contain player-name-like
-   text, automatically skipping the known noise (position/entity spam, chat, and the
-   party family above). It stays silent until an *unexpected* name-bearing packet shows
-   up — that packet is the roster candidate.
-2. Open the Linkshell window, then just **play for a few minutes** (zone around, let
-   members log in/out). No need to know the exact trigger.
+**Leading theory (from packet reverse-engineering docs):** retail's group-list packets
+**`0x0DD` (GP_SERV_GROUP_LIST)** and **`0x0E2` (GROUP_LIST2)** carry, per member, a name
+(offset `0x28`), zone (`0x20`), main job/level (`0x22`/`0x23`) **and a "Kind" byte at `0x1C`**.
+`Kind == 0` is your party/alliance; a **non-zero Kind** is the strongest suspect for how
+HorizonXI pushes the online linkshell roster (reusing the existing client handler). Those
+packets arrive **at login**.
+
+**Recommended workflow — `group` mode across a relog:**
+
+1. `/lsbridge pktdump group` — dumps only the party/group/linkshell family
+   (`0x0C8/0x0DD/0x0DF/0x0E0/0x0E1/0x0E2`).
+2. **Log out to character select and back in** with your LS pearl equipped (do this while LS
+   members who are **not** in your party are online), then play briefly.
 3. `/lsbridge pktdump off` — stop.
-4. Any packet written to `packets_debug.txt` is the roster candidate; its id + ASCII
-   column reveal the layout (name field, zone id, job byte, etc.).
+4. In `packets_debug.txt`, look at each `0x0DD`/`0x0E2` entry's byte `0x1C` (**Kind**): any
+   entry with a non-zero Kind is an online member that isn't your party — i.e. the roster.
+   Its name (`0x28`), zone (`0x20`) and job (`0x22`) decode the rest.
 
 Other tools:
 
-- `/lsbridge pktdump all` — dump every packet except high-volume noise (bigger/noisier;
-  use for a full login/zone burst capture).
-- `/lsbridge pktscan` (start → do something → stop) — just lists which packet ids appear.
+- `/lsbridge pktdump names` — dump only packets with player-name-like text (skips the party
+  family, so it will *not* catch a `0x0DD`-based roster; use `group` for that).
+- `/lsbridge pktdump all` — dump every packet except high-volume noise (full login/zone burst).
+- `/lsbridge pktscan` (start → relog → stop) — lists which packet ids appear; watch for any id
+  **above `0x11E`**, which would be a genuinely custom HorizonXI packet.
 - `/lsbridge pktdump 0xNNN` — dump a single suspected id.
 
 Once the id and field offsets are known, that packet can be parsed into a table and

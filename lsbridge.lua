@@ -87,11 +87,19 @@ local scrollToBottom = false
 --                 the known party/position/chat noise. Best net for the roster:
 --                 turn it on, then open the Linkshell window / play a few minutes
 --                 and any unexpected name-bearing packet is flagged automatically.
+--   pktDumpGroup: dump ONLY the party/group/linkshell-structure packets (0x0C8,
+--                 0x0DD, 0x0DF, 0x0E0, 0x0E1, 0x0E2). HorizonXI most likely reuses
+--                 the group-list packet (0x0DD/0x0E2) with a non-zero "Kind" byte
+--                 at offset 0x1C to push the online LS roster at login. This mode
+--                 captures the whole family in one relog so each entry's Kind /
+--                 name(0x28) / zone(0x20) / job(0x22) can be decoded. (names mode
+--                 deliberately skips 0x0DD, so use this to catch the roster.)
 local pktScan = false
 local pktScanSeen = {}
 local pktDumpId = nil
 local pktDumpAll = false
 local pktDumpNames = false
+local pktDumpGroup = false
 local pktDumpCount = 0
 local PKT_DUMP_MAX = 4000  -- auto-stop so a forgotten 'all' dump can't fill the disk
 -- Ultra-frequent packets that flood during zone-in and carry no roster data
@@ -105,6 +113,14 @@ local PKT_NOISE = { [0x00D] = true, [0x00E] = true, [0x037] = true }
 local PKT_NAMES_SKIP = {
     [0x00D] = true, [0x00E] = true, [0x037] = true, [0x017] = true,
     [0x00A] = true, [0x0C8] = true, [0x0DD] = true, [0x0DF] = true,
+}
+-- The party/group/linkshell-structure family, dumped together by 'group' mode.
+-- 0x0DD/0x0E2 (GP_SERV_GROUP_LIST / GROUP_LIST2) carry name(0x28) + zone(0x20) +
+-- main job(0x22) plus a "Kind" byte(0x1C): Kind 0 = your party/alliance, while a
+-- non-zero Kind is the leading suspect for HorizonXI's online linkshell roster.
+local PKT_GROUP = {
+    [0x0C8] = true, [0x0DD] = true, [0x0DF] = true,
+    [0x0E0] = true, [0x0E1] = true, [0x0E2] = true,
 }
 
 ------------------------------------------------------------
@@ -375,7 +391,7 @@ end
 
 ashita.events.register('packet_in', 'lsbridge_packet_cb', function(e)
     -- Read-only: never blocks or modifies packets. Fast no-op when idle.
-    if not pktScan and not pktDumpId and not pktDumpAll and not pktDumpNames then return end
+    if not pktScan and not pktDumpId and not pktDumpAll and not pktDumpNames and not pktDumpGroup then return end
     if pktScan then
         local rec = pktScanSeen[e.id]
         if rec then
@@ -401,6 +417,15 @@ ashita.events.register('packet_in', 'lsbridge_packet_cb', function(e)
             if pktDumpCount >= PKT_DUMP_MAX then
                 pktDumpNames = false
                 print(string.format('[LSBridge] pktdump names auto-stopped after %d packets.', PKT_DUMP_MAX))
+            end
+        end
+    elseif pktDumpGroup then
+        if PKT_GROUP[e.id] and e.data then
+            dumpPacket(e.id, e.size, e.data)
+            pktDumpCount = pktDumpCount + 1
+            if pktDumpCount >= PKT_DUMP_MAX then
+                pktDumpGroup = false
+                print(string.format('[LSBridge] pktdump group auto-stopped after %d packets.', PKT_DUMP_MAX))
             end
         end
     elseif pktDumpId and e.id == pktDumpId and e.data then
@@ -532,32 +557,43 @@ ashita.events.register('command', 'lsbridge_cmd_cb', function(e)
             pktDumpId = nil
             pktDumpAll = false
             pktDumpNames = false
+            pktDumpGroup = false
             print('[LSBridge] Packet dump OFF.')
         elseif a == 'all' then
             pktDumpAll = true
             pktDumpId = nil
             pktDumpNames = false
+            pktDumpGroup = false
             pktDumpCount = 0
             print(string.format('[LSBridge] Packet dump ALL ON -> %s. Now ZONE or RELOG to capture the roster burst, then /lsbridge pktdump off.', PACKET_LOG))
         elseif a == 'names' then
             pktDumpNames = true
             pktDumpAll = false
             pktDumpId = nil
+            pktDumpGroup = false
             pktDumpCount = 0
             print(string.format('[LSBridge] Packet dump NAMES ON -> %s. Open the Linkshell window / play a few minutes; any name-bearing packet is flagged. Then /lsbridge pktdump off.', PACKET_LOG))
+        elseif a == 'group' then
+            pktDumpGroup = true
+            pktDumpAll = false
+            pktDumpNames = false
+            pktDumpId = nil
+            pktDumpCount = 0
+            print(string.format('[LSBridge] Packet dump GROUP ON -> %s. Dumps the party/group/linkshell packets (0x0C8/0x0DD/0x0DF/0x0E0/0x0E1/0x0E2). Now RELOG (log out to character select and back in) with your LS pearl equipped, then /lsbridge pktdump off.', PACKET_LOG))
         else
             local id = tonumber(a)  -- accepts 0x0DD (hex) or a decimal id
             if not id then
-                print('[LSBridge] Usage: /lsbridge pktdump 0x0DD | all | names | off')
+                print('[LSBridge] Usage: /lsbridge pktdump 0x0DD | all | names | group | off')
             else
                 pktDumpId = id
                 pktDumpAll = false
                 pktDumpNames = false
+                pktDumpGroup = false
                 print(string.format('[LSBridge] Packet dump ON for 0x%03X -> %s. Open the Linkshell window to capture it.', id, PACKET_LOG))
             end
         end
     else
-        print('[LSBridge] Commands: /lsbridge [status|on|off|ls1|ls2|say|test [ls2]|clear|debug|logmode|window|clearchat|pktscan|pktdump <0xID|all|names|off>]')
+        print('[LSBridge] Commands: /lsbridge [status|on|off|ls1|ls2|say|test [ls2]|clear|debug|logmode|window|clearchat|pktscan|pktdump <0xID|all|names|group|off>]')
     end
 end)
 
