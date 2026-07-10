@@ -46,7 +46,7 @@ FFXI (Ashita)  --append-->  ffxi_to_discord.txt  --poll-->  Discord bot  -->  #l
 | `debug`    | Toggle printing every `text_in` mode to the console |
 | `logmode`  | Toggle logging every `text_in` mode to `modes_debug.txt` |
 | `pktscan`  | Toggle a summary scan of incoming packet ids (find the online-members packet — see below) |
-| `pktdump <0xID>` | Hex+ASCII dump a specific incoming packet id to `packets_debug.txt` (`off` to stop) |
+| `pktdump <0xID\|all\|off>` | Hex+ASCII dump packets to `packets_debug.txt`: a single id, `all` (everything except position/entity noise), or `off` |
 
 ## Detecting online linkshell members
 
@@ -56,18 +56,26 @@ the whole online roster, and there's no published packet id for Horizon's versio
 the addon can't read it out of the box; the packet has to be identified live, then
 parsed.
 
-The addon ships two read-only diagnostics to do that (they never block or modify
-packets, and are off by default):
+The addon ships read-only diagnostics to do that (they never block or modify
+packets, and are off by default).
 
-1. `/lsbridge pktscan` — start recording every incoming packet id (with a count and
-   last size).
-2. Open the in-game **Linkshell** window so the server sends the roster.
-3. `/lsbridge pktscan` — stop; it prints the ids seen (also written to
-   `packets_debug.txt`). The roster is usually an **infrequent id** that appears right
-   as the window opens.
-4. `/lsbridge pktdump 0xNNN` — dump that suspected id. The ASCII column makes member
-   **names / zone strings** obvious, which reveals the layout (name field, zone id,
-   job byte, etc.).
+**Important:** opening the in-game Linkshell window sends **no packet** — the client
+already has the roster cached. The full roster is delivered in a **burst at login or
+when you zone**, so it has to be captured then, not by opening the window.
+
+Recommended workflow (catches the roster during a zone):
+
+1. `/lsbridge pktdump all` — start dumping every incoming packet (except the
+   high-volume position/entity/status noise) to `packets_debug.txt`.
+2. **Zone** (walk across a zone line or use a Home Point / airship) or **relog** so the
+   server resends the roster.
+3. `/lsbridge pktdump off` — stop.
+4. Search `packets_debug.txt` for a known member name. The packet whose ASCII column
+   contains **names / zone strings** is the roster; its layout (name field, zone id,
+   job byte, etc.) is then read off the hex.
+
+`/lsbridge pktscan` (start → do something → stop) is the lighter tool for just listing
+which ids appear, and `/lsbridge pktdump 0xNNN` dumps a single suspected id.
 
 Once the id and field offsets are known, that packet can be parsed into a table and
 shown in an on-screen list (and optionally pushed to Discord). Note HorizonXI's
