@@ -78,9 +78,21 @@ local scrollToBottom = false
 --                 in-game Linkshell window opens/refreshes.
 --   pktDumpId   : when set to a packet id, write a hex+ASCII dump of just that
 --                 packet to PACKET_LOG so member names/zones/jobs are visible.
+--   pktDumpAll  : dump EVERY incoming packet (except the high-volume position/
+--                 entity noise below). The linkshell roster is only sent in a
+--                 burst at login/zone-in (never when you just open the window),
+--                 so enable this, then zone or relog, then grep the file for
+--                 member names to find the roster packet id + layout.
 local pktScan = false
 local pktScanSeen = {}
 local pktDumpId = nil
+local pktDumpAll = false
+local pktDumpCount = 0
+local PKT_DUMP_MAX = 4000  -- auto-stop so a forgotten 'all' dump can't fill the disk
+-- Ultra-frequent packets that flood during zone-in and carry no roster data
+-- (position / entity spawn / char-status spam). Skipped in 'all' mode so the
+-- file stays small enough to catch and read the roster burst.
+local PKT_NOISE = { [0x00D] = true, [0x00E] = true, [0x037] = true }
 
 ------------------------------------------------------------
 -- Write FFXI linkshell message to file for Discord bot.
@@ -321,7 +333,7 @@ end
 
 ashita.events.register('packet_in', 'lsbridge_packet_cb', function(e)
     -- Read-only: never blocks or modifies packets. Fast no-op when idle.
-    if not pktScan and not pktDumpId then return end
+    if not pktScan and not pktDumpId and not pktDumpAll then return end
     if pktScan then
         local rec = pktScanSeen[e.id]
         if rec then
@@ -331,7 +343,16 @@ ashita.events.register('packet_in', 'lsbridge_packet_cb', function(e)
             pktScanSeen[e.id] = { count = 1, size = e.size }
         end
     end
-    if pktDumpId and e.id == pktDumpId and e.data then
+    if pktDumpAll then
+        if not PKT_NOISE[e.id] and e.data then
+            dumpPacket(e.id, e.size, e.data)
+            pktDumpCount = pktDumpCount + 1
+            if pktDumpCount >= PKT_DUMP_MAX then
+                pktDumpAll = false
+                print(string.format('[LSBridge] pktdump all auto-stopped after %d packets.', PKT_DUMP_MAX))
+            end
+        end
+    elseif pktDumpId and e.id == pktDumpId and e.data then
         dumpPacket(e.id, e.size, e.data)
     end
 end)
@@ -448,23 +469,32 @@ ashita.events.register('command', 'lsbridge_cmd_cb', function(e)
             dumpScanSummary()
         end
     elseif sub == 'pktdump' then
-        -- Hex+ASCII dump a specific incoming packet id to packets_debug.txt so
-        -- member names/zones/jobs are visible. e.g. /lsbridge pktdump 0x0DD
+        -- Hex+ASCII dump of incoming packets to packets_debug.txt so member
+        -- names/zones/jobs are visible. Either a single id (e.g. 0x0DD), or
+        -- "all" to dump everything except high-volume noise. Use "all" then
+        -- zone/relog to catch the linkshell roster (only sent at login/zone-in).
         local a = (args[3] or ''):lower()
         if a == '' or a == 'off' then
             pktDumpId = nil
+            pktDumpAll = false
             print('[LSBridge] Packet dump OFF.')
+        elseif a == 'all' then
+            pktDumpAll = true
+            pktDumpId = nil
+            pktDumpCount = 0
+            print(string.format('[LSBridge] Packet dump ALL ON -> %s. Now ZONE or RELOG to capture the roster burst, then /lsbridge pktdump off.', PACKET_LOG))
         else
             local id = tonumber(a)  -- accepts 0x0DD (hex) or a decimal id
             if not id then
-                print('[LSBridge] Usage: /lsbridge pktdump 0x0DD  (hex id with 0x prefix, a decimal id, or "off")')
+                print('[LSBridge] Usage: /lsbridge pktdump 0x0DD | all | off')
             else
                 pktDumpId = id
+                pktDumpAll = false
                 print(string.format('[LSBridge] Packet dump ON for 0x%03X -> %s. Open the Linkshell window to capture it.', id, PACKET_LOG))
             end
         end
     else
-        print('[LSBridge] Commands: /lsbridge [status|on|off|ls1|ls2|say|test [ls2]|clear|debug|logmode|window|clearchat|pktscan|pktdump <0xID>]')
+        print('[LSBridge] Commands: /lsbridge [status|on|off|ls1|ls2|say|test [ls2]|clear|debug|logmode|window|clearchat|pktscan|pktdump <0xID|all|off>]')
     end
 end)
 
